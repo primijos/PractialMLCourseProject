@@ -1,0 +1,191 @@
+---
+title: "Practial ML Course Project"
+author: "Jose Oliver Segura"
+date: "6/28/2020"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Predicting physical exercise execution via wearables data
+The goal of this project is to be able to predict the "classe" of exercise execution of people via the data feed of the wearable devices (fitbit, jawbone, etc.) In order to do this we will use data from more than 14000 samples to build a ML prediction model.
+
+## Summary
+Weareable devices are a current trend and much of the data they generate can be used to what is called "quantified self". Data collection on this devices can also be used to infer some aspects of a user's daily activity. In this project we have used data from those devices in order to build a ML prediction model (based on the ensemble of other models) able to predict how a user was performing some exercising with more than a 97% of accuracy.
+
+
+### Data loading and cleaning
+
+First of all, we can setup or environment
+```{r}
+library(caret)
+library(caretEnsemble)
+library(doParallel)
+cl <- makePSOCKcluster(2)
+registerDoParallel(cl)
+```
+
+And then load our data
+```{r cache=T}
+trainingDSFname = "./pml-training.csv"
+testingDSFname = "./pml-testing.csv"
+originalTraining <- read.csv(trainingDSFname)
+# XXX since model training times are quite large, we can use, if needed, a small subset of
+# all the data just to check for syntaxis errors, parameter checking, etc
+#originalTraining <- originalTraining[sample(1:dim(originalTraining)[1],1500,replace=F),]
+modTraining <- originalTraining
+finalTesting <- read.csv(testingDSFname)
+```
+
+A quick glimpse to our training data reveals many columns with NA or empty ("") data. We can proceed to remove those columns.
+```{r}
+no_na_cols <- sapply(names(modTraining),function(n) {mean(is.na(modTraining[n]))<0.1})
+modTraining <- modTraining[,no_na_cols]
+no_empty_cols <- sapply(names(modTraining),function(n) {mean(modTraining[n]=="")<0.1})
+modTraining <- modTraining[,no_empty_cols]
+```
+
+We can also observe that there are other columns in or dataframe that, at first sight, don't seem appropriate for building our model (user_name). We can also observe that the training data includes some time-related columns. Building a time-series based model, at first sight, doesn't look either the most appropriate direction, so we'll try a first approach without taking them into consideration. Thus, we can remove all those columns.
+
+```{r}
+modTraining <- subset(modTraining,select=-c(X,user_name,raw_timestamp_part_1,raw_timestamp_part_2,cvtd_timestamp,num_window,new_window,cvtd_timestamp))
+
+finalTesting <- subset(finalTesting,select=-c(X,user_name,raw_timestamp_part_1,raw_timestamp_part_2,cvtd_timestamp,num_window,new_window,cvtd_timestamp))
+```
+
+
+Once we've cleaned or data, we can proceed to build train/test sets from the "training" original set. Note that the "testing" downloaded data doesn't contain the Y values (classe), and it will only used in the automated part of the assignment. Thus, we will use the original "training" set to create a real training/test split
+```{r cache=TRUE}
+set.seed(12345)
+inTrain <- createDataPartition(y=modTraining$classe,p=0.75, list=FALSE)
+training <- modTraining[inTrain,]
+testing <- modTraining[-inTrain,]
+```
+
+### Dataset exploration
+Once we've cleaned our data and created our real training/testing splits, we can perform some exploratory analysis on our trainig subset in order to decide how to build or model. First let's try to take a quick look on how the roll/pitch/yaw vaules for different sensors (belt/arm/dumbbell/forearm) are distributed for different "classe" values.
+```{r}
+a <- c("roll","pitch","yaw")
+b <- c("belt","arm","dumbbell","forearm")
+par(mfrow=c(length(a),length(b)),mai=rep(0.2,4))
+for (aa in a) {
+    for (bb in b) {
+        name <- paste(aa,bb,sep = "_")
+        boxplot(training[,name] ~ training$classe,main=name)
+    }
+}
+```
+
+From these plots we can deduce that looks like there are no clear discriminators amongst these measurements that are strongly related to each of the classes. All the boxplots reveal very similar distributions/medians, so looks clear that whatever model we decide to train, it must take into account many of the predictors.
+
+We can look for predictors with low information associated. First, let's try to find near zero vars
+```{r}
+nsv <- nearZeroVar(training,saveMetrics=T)
+sum(nsv$nzv==T)
+```
+Looks like all the remaining predictors after the initial cleanup are far from zero. No let's try to explore correlation between predictors
+```{r}
+M <- cor(training[,-53])
+diag(M) <- 0
+corvars <- which(M > 0.8,arr.ind=T)
+df <- data.frame(corvars)
+df[order(df$row),]
+```
+
+We can check that there are, as expected, high correlations between some measurements grouped by "sensor". For example, high correlations in rows 1-11 correspond to the "belt" wearable, and they expose how roll, yaw, accel and total accel in this wearable are highly correlated. This is quite similar to what happens with columns 21-25 (arm), 28-46 (dumbbell/forearm).
+
+This information lends us towards the use of some method of model building that takes into consideration the correlation amongst predictors. This translates in the use of PCA (Principal Component Analysis) for our model. Let's see how PCA works in our training set.
+
+```{r}
+components <- prcomp(training[,-length(training)])
+s <- summary(components)
+i <- s$importance
+pc_info <- data.frame(t(i))
+num_comp <- dim(pc_info[pc_info[3] < 0.95,])[1]+1
+num_comp
+```
+This result supports or initial thougts. Applying PCA to our predictors allows us to reduce the number of final predictors to 9 instead of the more than 60 that we are working with now.
+
+### Model building
+
+Once we've cleaned and explored or training dataset, and we've have decided which transformations to apply in our data before training/predicting with it, we can buil or model. Given the obvious complexity of the data we're dealing with, we've decided to build a stack or ensemble of models to try to maximize how different models predict with more accuracy some kind of "classe" events. 
+
+Now we can fit our models. We've decided to fit 5 models as base. The code below shows the steps performed to configure resampling of the training set and to build the 5 models we've decided to build, using these training control parameters and PCA a pre-process.
+```{r models,echo = FALSE, cache = TRUE}
+th <- 0.95
+control <- trainControl(method = "repeatedcv", number = 10, repeats = 3, search = "grid", savePredictions = "final", index = createResample(training$classe, 10), classProbs = TRUE, verboseIter = TRUE, preProcOptions = list(thresh=th))
+
+# List of algorithms to use in ensemble
+#"rf", "gbm", "nnet", "svmLinear"
+alg_list <- c("nnet","rf", "svmLinear","gbm","treebag")
+models <- caretList(classe ~ . , data = training, trControl = control, methodList = alg_list, preProcess="pca")
+```
+
+
+Once we've built our base models, we can use them to build the final model, aggregating predictions from all of them.
+```{r stackedmodel,echo=FALSE, cache=TRUE}                                                                          
+stackControl <- trainControl(method = "repeatedcv", number = 10, repeats = 3, savePredictions = TRUE, classProbs = TRUE, verboseIter = TRUE)
+
+tmp <- matrix(ncol=length(models),nrow=dim(training)[1])
+n <- c()
+i <- 1
+for (m in models) {
+    n <- append(n,paste("x",i,sep=""))
+    predicted <- predict(m,training)
+    tmp[,i] <- predicted
+    i <- i+1
+}
+new_df <- data.frame(tmp)
+stacked_model <- train(new_df,
+                       training$classe,
+                       method="rf",
+                       trControl = control,
+                       verbose=F)
+
+```
+
+At this point, we have a stacked model that uses Random Forest as the final algorithm based on five different models built previously. We can check its accuracy on the training dataset.
+
+```{r cache=TRUE}
+confusionMatrix(stacked_model$finalModel$predicted,training$classe)
+```
+
+The built model shows perfect accuracy on the training set. Obviously, the out-of-sample error rate will be higher, and we can't expect 100% accuracy on the test set (or new data sets), but let's seem how it performs on our testing dataset.
+```{r predict_test, cache=TRUE}
+tmp <- matrix(ncol=length(models),nrow=dim(testing)[1])
+n <- c()
+i <- 1
+for (m in models) {
+    n <- append(n,paste("x",i,sep=""))
+    predicted <- predict(m,testing)
+    tmp[,i] <- predicted
+    i <- i+1
+}
+new_df <- data.frame(tmp)
+predicted <- predict(stacked_model,new_df)
+confusionMatrix(predicted,testing$classe)
+```
+
+Results look very promising. We see almost a 98% accuracy in the test set, lower than in the trainig set, as expected, but very high.
+
+As a final step, we ran the short testing set (20 samples for the automated grading tool) using this model and we got a 95% grade (95% accuracy in our prediction). This confirms the model we've built is appropriate for predicting this kind of data.
+
+
+```{r echo=FALSE, include=FALSE}
+tmp <- matrix(ncol=length(models),nrow=dim(finalTesting)[1])
+n <- c()
+i <- 1
+for (m in models) {
+    n <- append(n,paste("x",i,sep=""))
+    predicted <- predict(m,finalTesting)
+    tmp[,i] <- predicted
+    i <- i+1
+}
+new_df <- data.frame(tmp)
+predict(stacked_model,new_df)
+```
+
+```{r include=FALSE, echo=FALSE}
+stopCluster(cl)
+```
